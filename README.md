@@ -1,20 +1,38 @@
-# international-cost-of-capital-app
-Streamlit app that compares a project's cost of equity and WACC in USD and the currency of any selected country.
+# International Cost of Capital App
 
-Developed for coursework (Professor Sergio Rebelo).
+Streamlit app comparing a project's cost of equity, cost of debt and WACC in USD and in the currency of any selected country.
 
-Features
+## Run
+```
+pip install -r requirements.txt
+streamlit run app.py
+```
+Deploy on Streamlit Community Cloud: push `app.py`, `requirements.txt`, `README.md` to GitHub, then choose the repo and `app.py`.
 
-Computes Cost of Equity, Pretax/After-Tax Borrowing Cost, and WACC in both USD and foreign target currencies.
+## Data (with refresh button)
+| Input | Source |
+|---|---|
+| Industry unlevered beta | Damodaran `betas.xls` (Industry Averages) |
+| BBB (Baa2) USD spread | Damodaran `ratings.html` (large non-financial firms) |
+| Corporate tax rates | OECD Corporate Tax Statistics (falls back to the 2026 course-packet table if the live page cannot be parsed) |
+| 10-year government yields | Trading Economics `/bonds` (falls back to course-packet yields) |
 
-Integrates data sources (Damodaran betas & spreads, OECD tax rates, Trading Economics government bond yields).
+Sources, data dates and live/fallback status are shown at the bottom of the app.
 
-Interactive parameter sliders/inputs for Equity Risk Premium, Target Debt Share, and manual overrides.
+## Method
+- D/E = d/(1-d); beta_E = beta_U [1 + (1-tau) D/E]
+- Re(USD) = Rf_US + beta_E x ERP; Rd = Rf_US + s; WACC = (1-d) Re + d Rd (1-tau)
+- F = (1+Rf*)/(1+Rf); Re* = (1+Re) F - 1; default s* = s F, Rd* = Rf* + s*
+- Same tax rate (U.S. or selected country), debt share and ERP in both currencies.
 
-Side-by-side comparison and downloadable CSV results.
+## Defaults
+Software (System & Application), United States, U.S. tax rate, ERP 6.5%, debt 30%.
 
-Running Locally
+## Overrides
+Unlevered beta, tax rate, USD spread, both countries' yields, and foreign-currency spread (when off, shows the auto value s x F).
 
-Install dependencies: pip install -r requirements.txt
+## Checks
+Equal yields give equal USD/local results; d = 0 gives WACC = cost of equity; overriding the foreign spread leaves USD unchanged.
 
-Run Streamlit app: streamlit run app.py
+## Limitations
+U.S. market as risk benchmark, no country risk premium, CAPM only, fully usable interest deductions, government yields as risk-free proxies.
