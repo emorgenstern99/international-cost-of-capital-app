@@ -328,7 +328,8 @@ def main():
         sb.caption(f"Damodaran unlevered beta: {beta_auto:.4f}")
 
     erp = sb.number_input("Annual equity risk premium (%)", value=6.5, step=0.25, min_value=0.0) / 100
-    d = sb.slider("Fraction financed with debt (%)", 0, 90, 30) / 100
+    d = sb.number_input("Fraction financed with debt (%)", min_value=0.0, max_value=95.0, value=30.0,
+                        step=1.0, format="%.2f") / 100
 
     countries = sorted(set(bulk) | set(FALLBACK_YIELDS) | set(EXTRA_COUNTRIES))
     country = sb.selectbox("Project country / currency", countries, index=countries.index(DEFAULT_COUNTRY))
