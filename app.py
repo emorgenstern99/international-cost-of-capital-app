@@ -14,6 +14,7 @@ Formulas (course packet, ch. 12):
 import io
 import re
 from datetime import datetime
+from html import unescape
 from html.parser import HTMLParser
 
 import numpy as np
@@ -239,10 +240,44 @@ def load_yields():
                 return out, meta
         except Exception as e:  # noqa: BLE001
             diag.append(f"{url.split('.com')[1]}: {err(e)}")
-    meta.update(live=False, status="Fallback", date="Nov 6, 2026",
-                note="Trading Economics could not be read automatically (" + "; ".join(diag) +
-                     "); using course-packet yields. Enter yields manually with the override boxes if needed.")
-    return dict(FALLBACK_YIELDS), meta
+    meta.update(live=False, status="Fallback", note="", diag="; ".join(diag))
+    return {}, meta
+
+
+SLUGS = {"Türkiye": "turkey", "Czechia": "czech-republic", "South Korea": "south-korea",
+         "United States": "united-states", "United Kingdom": "united-kingdom",
+         "United Arab Emirates": "united-arab-emirates", "Cabo Verde": "cape-verde", "Congo": "congo"}
+EXTRA_COUNTRIES = [c for c in FALLBACK_TAX if c not in ("Greenland", "Monaco", "Macau", "Congo", "Brunei")]
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_country_yield(name):
+    """Scrape the server-rendered Trading Economics country page -> (yield %, date text)."""
+    slug = SLUGS.get(name, name.lower().replace(" ", "-"))
+    html = get_html(f"https://tradingeconomics.com/{slug}/government-bond-yield")
+    html = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", html, flags=re.S)
+    text = " ".join(unescape(re.sub(r"<[^>]+>", " ", html)).split())
+    m = re.search(r"\b10Y (-?\d+(?:\.\d+)?) -?[\d.]+\s?% -?[\d.]+\s?% -?[\d.]+\s?% ([A-Z][a-z]{2}/\d{2}|\d{4}-\d{2}-\d{2})",
+                  text)
+    if m:
+        return float(m.group(1)), m.group(2)
+    m = re.search(r"10Y (?:Bond )?Yield[^%]{0,80}?(-?\d+(?:\.\d+)?)\s?%(?: on ([A-Z][a-z]+ \d{1,2}, \d{4}))?", text)
+    if m:
+        return float(m.group(1)), m.group(2) or "latest"
+    raise ValueError(f"no 10Y yield found on {slug} page ({len(text)} chars)")
+
+
+def resolve_yield(name, bulk, bulk_meta):
+    """Returns (yield %, date, status, note)."""
+    if name in bulk:
+        return bulk[name], bulk_meta["date"], "Live", ""
+    try:
+        y, d = fetch_country_yield(name)
+        return y, d, "Live", ""
+    except Exception as e:  # noqa: BLE001
+        return (FALLBACK_YIELDS.get(name), "Nov 6, 2026", "Fallback",
+                f"Trading Economics page for {name} could not be read ({err(e)}); "
+                + ("using the course-packet yield." if name in FALLBACK_YIELDS else "enter the yield manually."))
 
 
 # ------------------------------------------------------------------ calculations
@@ -274,8 +309,7 @@ def main():
     betas, beta_meta = load_betas()
     spread_auto, spread_meta = load_bbb_spread()
     taxes, tax_meta = load_tax()
-    yields, yld_meta = load_yields()
-    yields.setdefault(DEFAULT_COUNTRY, FALLBACK_YIELDS[DEFAULT_COUNTRY])
+    bulk, bulk_meta = load_yields()
 
     sb = st.sidebar
     sb.header("Project assumptions")
@@ -296,7 +330,7 @@ def main():
     erp = sb.number_input("Annual equity risk premium (%)", value=6.5, step=0.25, min_value=0.0) / 100
     d = sb.slider("Fraction financed with debt (%)", 0, 90, 30) / 100
 
-    countries = sorted(yields)
+    countries = sorted(set(bulk) | set(FALLBACK_YIELDS) | set(EXTRA_COUNTRIES))
     country = sb.selectbox("Project country / currency", countries, index=countries.index(DEFAULT_COUNTRY))
 
     sb.subheader("Corporate tax rate")
@@ -313,11 +347,14 @@ def main():
     tau = tax_pct / 100
 
     sb.subheader("Yields and spreads")
+    us_y, us_d, us_st, us_note = resolve_yield("United States", bulk, bulk_meta)
+    f_y, f_d, f_st, f_note = resolve_yield(country, bulk, bulk_meta)
+    us_y = us_y if us_y is not None else FALLBACK_YIELDS["United States"]
     ov_us = sb.checkbox("Override U.S. 10-year yield")
-    y_us = sb.number_input("U.S. 10-year yield (%)", value=float(yields["United States"]), step=0.05,
-                           format="%.3f") if ov_us else yields["United States"]
-    ov_f = sb.checkbox("Override selected-country 10-year yield")
-    y_f_auto = yields[country]
+    y_us = sb.number_input("U.S. 10-year yield (%)", value=float(us_y), step=0.05,
+                           format="%.3f") if ov_us else us_y
+    ov_f = sb.checkbox("Override selected-country 10-year yield", value=f_y is None)
+    y_f_auto = f_y if f_y is not None else float(y_us)
     y_f = sb.number_input(f"{country} 10-year yield (%)", value=float(y_f_auto), step=0.05,
                           format="%.3f") if ov_f else y_f_auto
     ov_s = sb.checkbox("Override USD BBB spread")
@@ -399,15 +436,19 @@ def main():
 
     # ---- sources
     st.subheader("Data sources")
-    src = pd.DataFrame([
+    src_rows = [
         ("Unlevered beta", beta_meta), ("BBB spread", spread_meta),
-        ("Corporate tax rates", tax_meta), ("10-year yields", yld_meta)],
-        columns=["Item", "meta"])
+        ("Corporate tax rates", tax_meta),
+        ("10-year yield, United States", {"source": "Trading Economics country page", "date": us_d,
+                                          "live": us_st == "Live", "status": us_st, "note": us_note}),
+        (f"10-year yield, {country}", {"source": "Trading Economics country page", "date": f_d,
+                                       "live": f_st == "Live", "status": f_st, "note": f_note})]
+    src = pd.DataFrame(src_rows, columns=["Item", "meta"])
     src["Source"] = src["meta"].map(lambda m: m["source"])
     src["Data date"] = src["meta"].map(lambda m: m["date"])
     src["Status"] = src["meta"].map(lambda m: m.get("status", "Live" if m["live"] else "Fallback"))
     st.dataframe(src.drop(columns="meta"), use_container_width=True, hide_index=True)
-    for m in (beta_meta, spread_meta, tax_meta, yld_meta):
+    for m in [beta_meta, spread_meta, tax_meta] + [x[1] for x in src_rows[3:]]:
         if m["note"]:
             (st.info if m.get("status") == "Embedded" else st.warning)(m["note"])
     st.caption(f"Page loaded {datetime.now():%Y-%m-%d %H:%M}. Use 'Refresh source data' to refetch.")
