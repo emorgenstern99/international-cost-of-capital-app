@@ -198,37 +198,51 @@ def load_tax():
         return dict(FALLBACK_TAX), meta
 
 
+TE_URLS = [TE_URL, "https://tradingeconomics.com/country-list/government-bond-yield"]
+_RAW_RE = re.compile(r'href="/[a-z0-9\-]+/government-bond-yield"[^>]*>(.{1,80}?)</a>.{0,300}?<td[^>]*>\s*(-?\d+(?:\.\d+)?)\s*</td>', re.S)
+_DATE_RE = re.compile(r"^(?:[A-Z][a-z]{2}/\d{2}|[A-Z][a-z]{2} \d{4}|\d{4}-\d{2}-\d{2})$")
+
+
+def _yields_from_tables(tables):
+    """Header-agnostic: country = first text cell, yield = first plausible number after it."""
+    out, dates = {}, []
+    for tbl in tables:
+        for r in tbl:
+            ti = next((i for i, c in enumerate(r) if re.search(r"[A-Za-z]{3}", c) and not _DATE_RE.match(c)), None)
+            if ti is None:
+                continue
+            y = next((to_num(c) for c in r[ti + 1:] if re.fullmatch(r"-?\d+(?:\.\d+)?\s*%?", c.strip())), None)
+            if y is not None and -2 < y < 100:
+                out[canon(r[ti])] = y
+                dates += [c for c in r if _DATE_RE.match(c)]
+    return out, dates
+
+
 @st.cache_data(ttl=1800, show_spinner=False)
 def load_yields():
-    meta = {"source": "Trading Economics /bonds (10-year)", "live": True, "date": "n/a", "note": "",
-            "status": "Live"}
-    try:
-        out, dates = {}, []
-        for tbl in parse_tables(get_html(TE_URL)):
-            hdr = next((i for i, r in enumerate(tbl[:3]) if any(c.strip().lower() == "yield" for c in r)), None)
-            if hdr is None:
-                continue
-            H = [c.strip().lower() for c in tbl[hdr]]
-            yi_end = len(H) - H.index("yield")  # position counted from the right (robust to extra left cells)
-            for r in tbl[hdr + 1:]:
-                if len(r) < yi_end:
-                    continue
-                yi = len(r) - yi_end
-                name = next((c for c in r[:yi] if re.search(r"[A-Za-z]{3}", c)), None)
-                y = to_num(r[yi])
-                if name and y is not None:
-                    out[canon(name)] = y
-                    if "date" in H:
-                        dates.append(r[len(r) - (len(H) - H.index("date"))])
-        if len(out) < 10:
-            raise ValueError(f"only {len(out)} yields parsed")
-        meta["date"] = max(set(dates), key=dates.count) if dates else datetime.now().strftime("%Y-%m-%d")
-        return out, meta
-    except Exception as e:  # noqa: BLE001
-        meta.update(live=False, status="Fallback", date="Nov 6, 2026",
-                    note=f"Trading Economics fetch failed ({err(e)}); using course-packet yields "
-                         "(or enter yields manually).")
-        return dict(FALLBACK_YIELDS), meta
+    meta = {"source": "Trading Economics (10-year government bond yields)", "live": True, "date": "n/a",
+            "note": "", "status": "Live"}
+    diag = []
+    for url in TE_URLS:
+        try:
+            html = get_html(url)
+            tables = parse_tables(html)
+            out, dates = _yields_from_tables(tables)
+            if len(out) < 10:  # second method: scan raw HTML for "country link ... first number cell"
+                for m in _RAW_RE.finditer(html):
+                    out[canon(re.sub(r"<[^>]+>", "", m.group(1)).strip())] = float(m.group(2))
+                dates += re.findall(r">\s*([A-Z][a-z]{2}/\d{2})\s*<", html)[:50]
+            diag.append(f"{url.split('.com')[1]}: {len(html)} bytes, {len(tables)} tables, {len(out)} yields")
+            if len(out) >= 10:
+                meta["source"] = f"Trading Economics {url.split('.com')[1]} (10-year)"
+                meta["date"] = max(set(dates), key=dates.count) if dates else datetime.now().strftime("%Y-%m-%d")
+                return out, meta
+        except Exception as e:  # noqa: BLE001
+            diag.append(f"{url.split('.com')[1]}: {err(e)}")
+    meta.update(live=False, status="Fallback", date="Nov 6, 2026",
+                note="Trading Economics could not be read automatically (" + "; ".join(diag) +
+                     "); using course-packet yields. Enter yields manually with the override boxes if needed.")
+    return dict(FALLBACK_YIELDS), meta
 
 
 # ------------------------------------------------------------------ calculations
