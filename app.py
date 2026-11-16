@@ -14,13 +14,19 @@ Formulas (course packet, ch. 12):
 import io
 import re
 from datetime import datetime
+from html.parser import HTMLParser
 
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; CostOfCapitalApp/1.0)"}
+HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/124.0 Safari/537.36"),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 BETA_URL = "https://pages.stern.nyu.edu/~adamodar/pc/datasets/betas.xls"
 RATINGS_URL = "https://pages.stern.nyu.edu/adamodar/New_Home_Page/datafile/ratings.html"
 OECD_URL = ("https://www.oecd.org/en/publications/corporate-tax-statistics-2024_9c27d6e8-en/"
@@ -61,6 +67,55 @@ ALIASES = {"Turkey": "Türkiye", "Czech Republic": "Czechia", "Slovak Republic":
 def canon(name: str) -> str:
     name = re.sub(r"[\*†\d]+$", "", str(name)).strip()
     return ALIASES.get(name, name)
+
+
+class _TableParser(HTMLParser):
+    """Dependency-free HTML table extractor: list of tables -> rows -> cell text."""
+    def __init__(self):
+        super().__init__()
+        self.tables, self.row, self.cell = [], None, None
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "table":
+            self.tables.append([])
+        elif tag == "tr" and self.tables:
+            self.row = []
+        elif tag in ("td", "th") and self.row is not None:
+            self.cell = []
+
+    def handle_endtag(self, tag):
+        if tag in ("td", "th") and self.cell is not None and self.row is not None:
+            self.row.append(" ".join("".join(self.cell).split()))
+            self.cell = None
+        elif tag == "tr" and self.row is not None and self.tables:
+            if self.row:
+                self.tables[-1].append(self.row)
+            self.row = None
+
+    def handle_data(self, data):
+        if self.cell is not None:
+            self.cell.append(data)
+
+
+def get_html(url):
+    r = requests.get(url, headers=HEADERS, timeout=30)
+    r.raise_for_status()
+    return r.text
+
+
+def parse_tables(html):
+    p = _TableParser()
+    p.feed(html)
+    return p.tables
+
+
+def to_num(x):
+    m = re.search(r"-?\d+(?:\.\d+)?", str(x).replace(",", ""))
+    return float(m.group(0)) if m else None
+
+
+def err(e):
+    return f"{type(e).__name__}: {str(e)[:120]}"
 
 
 # ------------------------------------------------------------------ data fetch
@@ -116,57 +171,63 @@ def load_bbb_spread():
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def load_tax():
-    meta = {"source": "OECD Corporate Tax Statistics (statutory CIT rates)", "live": True, "date": "n/a", "note": ""}
+    meta = {"source": "OECD Corporate Tax Statistics (statutory CIT rates)", "live": True, "date": "n/a",
+            "note": "", "status": "Live"}
     try:
-        r = requests.get(OECD_URL, headers=HEADERS, timeout=30)
-        r.raise_for_status()
         best = {}
-        for t in pd.read_html(io.StringIO(r.text)):
-            cname = next((c for c in t.columns if re.search(r"country|jurisdiction", str(c), re.I)), None)
-            if cname is None:
+        for tbl in parse_tables(get_html(OECD_URL)):
+            hdr = next((i for i, r in enumerate(tbl[:3]) if any(re.search(r"country|jurisdiction", c, re.I)
+                                                              for c in r)), None)
+            if hdr is None:
                 continue
-            vals = t.iloc[:, -1]
-            rates = {canon(k): float(v) for k, v in zip(t[cname], pd.to_numeric(vals, errors="coerce"))
-                     if pd.notna(v) and 0 < v < 100}
+            rates = {}
+            for r in tbl[hdr + 1:]:
+                v = to_num(r[-1]) if len(r) > 1 else None
+                if v is not None and 0 < v < 100 and re.search(r"[A-Za-z]{3}", r[0]):
+                    rates[canon(r[0])] = v
             if len(rates) > len(best):
-                best, meta["date"] = rates, str(t.columns[-1])
+                best, meta["date"] = rates, tbl[hdr][-1]
         if len(best) < 30:
-            raise ValueError("table not parsed")
+            raise ValueError("no usable rate table in page")
         return best, meta
     except Exception as e:  # noqa: BLE001
-        meta.update(live=False, date="2026",
-                    source="OECD Corporate Tax Statistics 2026 (values from course packet)",
-                    note=f"Live OECD fetch failed ({type(e).__name__}); showing packet values.")
+        meta.update(live=False, status="Embedded", date="2026",
+                    source="OECD Corporate Tax Statistics 2026 (table embedded from course packet)",
+                    note=f"OECD page could not be read automatically ({err(e)}); using the embedded 2026 OECD "
+                         "table. Use the tax override for any country not covered.")
         return dict(FALLBACK_TAX), meta
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def load_yields():
-    meta = {"source": "Trading Economics /bonds (10-year)", "live": True, "date": "n/a", "note": ""}
+    meta = {"source": "Trading Economics /bonds (10-year)", "live": True, "date": "n/a", "note": "",
+            "status": "Live"}
     try:
-        r = requests.get(TE_URL, headers=HEADERS, timeout=30)
-        r.raise_for_status()
         out, dates = {}, []
-        for t in pd.read_html(io.StringIO(r.text)):
-            cols = [str(c) for c in t.columns]
-            if "Yield" not in cols:
+        for tbl in parse_tables(get_html(TE_URL)):
+            hdr = next((i for i, r in enumerate(tbl[:3]) if any(c.strip().lower() == "yield" for c in r)), None)
+            if hdr is None:
                 continue
-            for _, row in t.iterrows():
-                name = next((str(v).strip() for v in row.values
-                             if isinstance(v, str) and re.search(r"[A-Za-z]{3}", v)
-                             and not re.fullmatch(r"[A-Za-z]{3}/\d{1,2}|\d{1,2}:\d{2}", v.strip())), None)
-                y = pd.to_numeric(row["Yield"], errors="coerce")
-                if name and pd.notna(y):
-                    out[canon(name)] = float(y)
-                    if "Date" in cols:
-                        dates.append(str(row["Date"]))
+            H = [c.strip().lower() for c in tbl[hdr]]
+            yi_end = len(H) - H.index("yield")  # position counted from the right (robust to extra left cells)
+            for r in tbl[hdr + 1:]:
+                if len(r) < yi_end:
+                    continue
+                yi = len(r) - yi_end
+                name = next((c for c in r[:yi] if re.search(r"[A-Za-z]{3}", c)), None)
+                y = to_num(r[yi])
+                if name and y is not None:
+                    out[canon(name)] = y
+                    if "date" in H:
+                        dates.append(r[len(r) - (len(H) - H.index("date"))])
         if len(out) < 10:
-            raise ValueError("yield table not parsed")
+            raise ValueError(f"only {len(out)} yields parsed")
         meta["date"] = max(set(dates), key=dates.count) if dates else datetime.now().strftime("%Y-%m-%d")
         return out, meta
     except Exception as e:  # noqa: BLE001
-        meta.update(live=False, date="Nov 6, 2026",
-                    note=f"Live fetch failed ({type(e).__name__}); showing course-packet yields.")
+        meta.update(live=False, status="Fallback", date="Nov 6, 2026",
+                    note=f"Trading Economics fetch failed ({err(e)}); using course-packet yields "
+                         "(or enter yields manually).")
         return dict(FALLBACK_YIELDS), meta
 
 
@@ -330,11 +391,11 @@ def main():
         columns=["Item", "meta"])
     src["Source"] = src["meta"].map(lambda m: m["source"])
     src["Data date"] = src["meta"].map(lambda m: m["date"])
-    src["Status"] = src["meta"].map(lambda m: "Live" if m["live"] else "Fallback")
+    src["Status"] = src["meta"].map(lambda m: m.get("status", "Live" if m["live"] else "Fallback"))
     st.dataframe(src.drop(columns="meta"), use_container_width=True, hide_index=True)
     for m in (beta_meta, spread_meta, tax_meta, yld_meta):
         if m["note"]:
-            st.warning(m["note"])
+            (st.info if m.get("status") == "Embedded" else st.warning)(m["note"])
     st.caption(f"Page loaded {datetime.now():%Y-%m-%d %H:%M}. Use 'Refresh source data' to refetch.")
 
 
